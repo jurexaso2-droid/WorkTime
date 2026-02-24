@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Face Timer</title>
+
+    <!-- P2P Networking -->
+    <script src="https://unpkg.com/peerjs@1.4.7/dist/peerjs.min.js"></script>
+    <!-- AI Models -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/blazeface"></script>
+
+    <style>
+        :root { --bg: #000000; --surface: #1a1a1a; --primary: #ff3b30; --text: #ffffff; }
+        
+        body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: sans-serif; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+        
+        /* LAYOUT */
+        .container { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; width: 100%; position: relative; }
+        
+        /* CARD STYLES */
+        .card { background: var(--surface); padding: 20px; border-radius: 12px; max-width: 400px; width: 90%; text-align: center; box-shadow: 0 4px 10px rgba(0,0,0,0.5); z-index: 10; }
+        
+        h2 { margin: 0 0 10px 0; color: white; }
+        p { color: #aaa; font-size: 0.9rem; }
+        
+        button { background: var(--primary); color: white; border: none; padding: 15px; width: 100%; border-radius: 8px; font-size: 1rem; font-weight: bold; cursor: pointer; margin-top: 10px; }
+        button.secondary { background: #333; border: 1px solid #555; }
+        
+        input { width: 100%; padding: 12px; margin: 10px 0; background: #222; border: 1px solid #444; color: white; border-radius: 6px; text-align: center; box-sizing: border-box; }
+
+        /* VIDEO & OVERLAY */
+        #monitor-view { position: relative; width: 100%; height: 100%; background: black; display: flex; align-items: center; justify-content: center; }
+        
+        video { 
+            position: absolute; 
+            max-width: 100%; 
+            max-height: 100%; 
+            width: auto; 
+            height: auto; 
+        }
+        
+        canvas { 
+            position: absolute; 
+            top: 0; left: 0; 
+            z-index: 5; /* On top of video */
+        }
+
+        /* ID DISPLAY */
+        .id-box { font-family: monospace; font-size: 1.5rem; letter-spacing: 2px; color: var(--primary); margin: 10px 0; padding: 10px; border: 1px dashed #444; cursor: pointer; }
+
+        /* STATUS BADGE */
+        .status-badge { position: absolute; top: 20px; right: 20px; background: rgba(0,0,0,0.7); padding: 5px 15px; border-radius: 20px; border: 1px solid #444; z-index: 20; font-size: 0.8rem; }
+
+        .hidden { display: none !important; }
+    </style>
+</head>
+<body>
+
+<!-- PAGE: ROLE SELECT -->
+<div id="p-role" class="container">
+    <div class="card">
+        <h2>AI Attendance</h2>
+        <p>Select device role:</p>
+        <button onclick="startMonitor()">💻 Start as Monitor (New Phone)</button>
+        <button class="secondary" onclick="startCamera()">📷 Start as Camera (Old Phone)</button>
+        <div style="margin-top:15px; text-align:left;">
+            <p>Shift Start Time:</p>
+            <input type="time" id="shift-time" value="08:00">
+        </div>
+    </div>
+</div>
+
+<!-- PAGE: MONITOR HOST -->
+<div id="p-monitor" class="container hidden">
+    <!-- WAITING SCREEN -->
+    <div id="monitor-waiting" class="card">
+        <h2>Waiting for Camera</h2>
+        <p>Enter this ID on the Old Phone:</p>
+        <div class="id-box" id="host-id" onclick="copyId()">Generating...</div>
+        <p>(Tap to Copy)</p>
+    </div>
+
+    <!-- LIVE VIEW -->
+    <div id="monitor-view" class="hidden">
+        <div class="status-badge">🔴 Live Feed</div>
+        <video id="remote-video" autoplay playsinline></video>
+        <canvas id="overlay"></canvas>
+    </div>
+</div>
+
+<!-- PAGE: CAMERA CLIENT -->
+<div id="p-camera" class="container hidden">
+    <div class="card" id="cam-setup">
+        <h2>Connect Camera</h2>
+        <input type="text" id="target-id" placeholder="Paste Monitor ID here">
+        <button onclick="connectToHost()">🔗 Connect</button>
+    </div>
+    <div id="cam-active" class="hidden" style="text-align:center;">
+        <h3 style="color:var(--primary);">Camera Active</h3>
+        <p>Streaming to Monitor...</p>
+        <video id="local-video" autoplay playsinline muted style="width: 200px; opacity: 0.5; border-radius:10px;"></video>
+    </div>
+</div>
+
+<script>
+    // --- SETTINGS ---
+    let shiftStart = "08:00";
+    document.getElementById('shift-time').addEventListener('change', e => shiftStart = e.target.value);
+
+    // --- GLOBAL VARS ---
+    let peer, conn, model;
+    let workSession = { active: false, start: null, name: "Worker" };
+    
+    // --- DOM ---
+    const pages = {
+        role: document.getElementById('p-role'),
+        monitor: document.getElementById('p-monitor'),
+        camera: document.getElementById('p-camera')
+    };
+
+    function show(page) {
+        Object.values(pages).forEach(p => p.classList.add('hidden'));
+        page.classList.remove('hidden');
+    }
+
+    // ============================================
+    // 💻 MONITOR LOGIC (HOST) - DOES THE AI
+    // ============================================
+    async function startMonitor() {
+        show(pages.monitor);
+        
+        // 1. Load AI Model immediately
+        model = await blazeface.load();
+        console.log("AI Model Loaded");
+
+        // 2. Start PeerJS Host
+        peer = new Peer();
+        peer.on('open', id => {
+            document.getElementById('host-id').innerText = id;
+        });
+
+        // 3. Listen for Incoming Video
+        peer.on('call', call => {
+            call.answer(); // Answer empty
+            call.on('stream', stream => {
+                const video = document.getElementById('remote-video');
+                video.srcObject = stream;
+                
+                // Hide waiting card, show video
+                document.getElementById('monitor-waiting').classList.add('hidden');
+                document.getElementById('monitor-view').classList.remove('hidden');
+
+                // Start AI Loop when video plays
+                video.onloadedmetadata = () => {
+                    startAILoop(video);
+                };
+            });
+        });
+    }
+
+    function startAILoop(video) {
+        const canvas = document.getElementById('overlay');
+        const ctx = canvas.getContext('2d');
+
+        setInterval(async () => {
+            // Match canvas size to video size exactly
+            if (video.videoWidth > 0 && canvas.width !== video.videoWidth) {
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+                // Match visual size
+                canvas.style.width = video.offsetWidth + "px";
+                canvas.style.height = video.offsetHeight + "px";
+            }
+
+            // Run AI detection on the video frame
+            const predictions = await model.estimateFaces(video, false);
+
+            // Clear previous drawings
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            if (predictions.length > 0) {
+                // Determine logic
+                if (!workSession.active) {
+                    workSession.active = true;
+                    workSession.start = new Date();
+                }
+                
+                // Draw UI for each face
+                predictions.forEach(pred => {
+                    drawFaceUI(ctx, pred);
+                });
+            }
+        }, 100); // Check 10 times a second for smooth tracking
+    }
+
+    function drawFaceUI(ctx, pred) {
+        const start = pred.topLeft;
+        const end = pred.bottomRight;
+        const width = end[0] - start[0];
+        const height = end[1] - start[1];
+        const x = start[0];
+        const y = start[1];
+
+        // 1. Calculate Time
+        const now = new Date();
+        const diff = now - workSession.start;
+        const hrs = Math.floor(diff / 3600000);
+        const mins = Math.floor((diff % 3600000) / 60000);
+        const secs = Math.floor((diff % 60000) / 1000);
+        const timerText = `${hrs}h ${mins}m ${secs}s`;
+
+        // 2. Check Late Status
+        const startTimeStr = workSession.start.toTimeString().slice(0,5);
+        const isLate = startTimeStr > shiftStart;
+        const color = isLate ? "#ff3b30" : "#32d74b"; // Red if late, Green if on time
+
+        // 3. Draw BOX (The Grid Line)
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 5;
+        ctx.strokeRect(x, y, width, height);
+
+        // 4. Draw TIMER Text (Top of Grid)
+        ctx.font = "bold 30px Courier New";
+        ctx.fillStyle = color;
+        ctx.fillText(timerText, x, y - 15); // 15px above box
+        
+        // 5. Draw Late/OnTime Label (Bottom of Grid)
+        ctx.font = "bold 16px sans-serif";
+        ctx.fillStyle = "white";
+        ctx.fillText(isLate ? "LATE" : "ON TIME", x, y + height + 20);
+    }
+
+    function copyId() {
+        const id = document.getElementById('host-id').innerText;
+        navigator.clipboard.writeText(id);
+        alert("ID Copied: " + id);
+    }
+
+    // ============================================
+    // 📷 CAMERA LOGIC (CLIENT) - DUMB TERMINAL
+    // ============================================
+    async function startCamera() {
+        show(pages.camera);
+    }
+
+    async function connectToHost() {
+        const hostId = document.getElementById('target-id').value;
+        if (!hostId) return alert("Enter Monitor ID");
+
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({ 
+                video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } }, 
+                audio: false 
+            });
+            
+            // Show local preview (mirrored)
+            document.getElementById('local-video').srcObject = stream;
+            document.getElementById('cam-setup').classList.add('hidden');
+            document.getElementById('cam-active').classList.remove('hidden');
+
+            peer = new Peer();
+            peer.on('open', () => {
+                // Call the monitor with our stream
+                const call = peer.call(hostId, stream);
+            });
+
+        } catch (err) {
+            alert("Camera Error: " + err.message);
+        }
+    }
+</script>
+</body>
+</html>
